@@ -569,7 +569,7 @@ class SparkContext(config: SparkConf) extends Logging {
     setupAndStartListenerBus()
     // 添加外部环境，例如外部jar、file等等
     postEnvironmentUpdate()
-    // 添加app任务到任务待执行列表
+    // 添加 event 到任务待执行列表
     postApplicationStart()
 
     // Post init

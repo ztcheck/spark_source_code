@@ -181,6 +181,7 @@ private[spark] class TaskSchedulerImpl(
     val tasks = taskSet.tasks
     logInfo("Adding task set " + taskSet.id + " with " + tasks.length + " tasks")
     this.synchronized {
+      // init new taskSetManager
       val manager = createTaskSetManager(taskSet, maxTaskFailures)
       val stage = taskSet.stageId
       val stageTaskSets =
@@ -193,8 +194,10 @@ private[spark] class TaskSchedulerImpl(
         throw new IllegalStateException(s"more than one active taskSet for stage $stage:" +
           s" ${stageTaskSets.toSeq.map{_._2.taskSet.id}.mkString(",")}")
       }
+      // add tm into queue
       schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
 
+      // 非本地模式
       if (!isLocal && !hasReceivedTask) {
         starvationTimer.scheduleAtFixedRate(new TimerTask() {
           override def run() {
@@ -210,6 +213,13 @@ private[spark] class TaskSchedulerImpl(
       }
       hasReceivedTask = true
     }
+
+    /*
+      这里是调用 CoarseGrainedSchedulerBackend 来提交任务
+      二次调用到 RpcEndpointRef 的 send 方法提交任务，最终调用到 Dispatcher.postMessage
+      向队列 receivers 中添加消息。同时异步通过线程池消费 receivers 中的数据【通过方法 TaskSchedulerImpl.resourceOffers 消费数据】
+     */
+
     backend.reviveOffers()
   }
 
@@ -311,6 +321,25 @@ private[spark] class TaskSchedulerImpl(
    * that tasks are balanced across the cluster.
    */
   def resourceOffers(offers: IndexedSeq[WorkerOffer]): Seq[Seq[TaskDescription]] = synchronized {
+    // 打印堆栈信息，方便查看调用链路
+    /*
+  调用链路：
+  通过 Dispatcher 中的 threadpool 来多线程来消费队列 receivers 中的数据
+      通过 Inbox 类调回到 LocalSchedulerBackend 最终调回到 TaskSchedulerImpl 类的 resourceOffers
+java.lang.Exception: Stack trace
+at java.lang.Thread.dumpStack(Thread.java:1329)
+at org.apache.spark.scheduler.TaskSchedulerImpl.resourceOffers(TaskSchedulerImpl.scala:322)
+at org.apache.spark.scheduler.local.LocalEndpoint.reviveOffers(LocalSchedulerBackend.scala:85)
+at org.apache.spark.scheduler.local.LocalEndpoint$$anonfun$receive$1.applyOrElse(LocalSchedulerBackend.scala:64)
+at org.apache.spark.rpc.netty.Inbox$$anonfun$process$1.apply$mcV$sp(Inbox.scala:117)
+at org.apache.spark.rpc.netty.Inbox.safelyCall(Inbox.scala:205)
+at org.apache.spark.rpc.netty.Inbox.process(Inbox.scala:101)
+at org.apache.spark.rpc.netty.Dispatcher$MessageLoop.run(Dispatcher.scala:221)
+at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+at java.lang.Thread.run(Thread.java:745)
+ */
+    Thread.dumpStack()
     // Mark each slave as alive and remember its hostname
     // Also track if new executor is added
     var newExecAvail = false
@@ -342,6 +371,7 @@ private[spark] class TaskSchedulerImpl(
       }
     }.getOrElse(offers)
 
+    // 这里采用 Random
     val shuffledOffers = shuffleOffers(filteredOffers)
     // Build a list of tasks to assign to each worker.
     val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK))
@@ -363,6 +393,11 @@ private[spark] class TaskSchedulerImpl(
       var launchedTaskAtCurrentMaxLocality = false
       for (currentMaxLocality <- taskSet.myLocalityLevels) {
         do {
+          /*
+            遍历 TaskSet.tasks 中的所有  task ，
+            调用到 dagScheduler.taskStarted 向队列 eventQueue 中添加消息event。
+            task的调用执行是通过 EventLoop 中的线程池 eventThread 不停的去消费线程池张中的人物
+           */
           launchedTaskAtCurrentMaxLocality = resourceOfferSingleTaskSet(
             taskSet, currentMaxLocality, shuffledOffers, availableCpus, tasks)
           launchedAnyTask |= launchedTaskAtCurrentMaxLocality

@@ -32,7 +32,8 @@ import org.apache.spark.storage.BlockManagerMaster
 import org.apache.spark.util.ManualClock
 
 /**
- * Test add and remove behavior of ExecutorAllocationManager.
+ * Test
+  * add and remove behavior of ExecutorAllocationManager.
  */
 class ExecutorAllocationManagerSuite
   extends SparkFunSuite

@@ -506,6 +506,9 @@ private[spark] class TaskSetManager(
         logInfo(s"Starting $taskName (TID $taskId, $host, executor ${info.executorId}, " +
           s"partition ${task.partitionId}, $taskLocality, ${serializedTask.limit()} bytes)")
 
+        /*
+          调用 AsyncEventQueue.post 向 eventQueue 中添加消息
+         */
         sched.dagScheduler.taskStarted(task, info)
         new TaskDescription(
           taskId,

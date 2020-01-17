@@ -349,7 +349,6 @@ class DAGScheduler(
   def  createShuffleMapStage(shuffleDep: ShuffleDependency[_, _, _], jobId: Int): ShuffleMapStage = {
     val rdd = shuffleDep.rdd
     val numTasks = rdd.partitions.length
-    // 又调回去了？初步猜测是异步调用。待确定
     val parents = getOrCreateParentStages(rdd, jobId)
     val id = nextStageId.getAndIncrement()
     val stage = new ShuffleMapStage(
@@ -377,8 +376,17 @@ class DAGScheduler(
       partitions: Array[Int],
       jobId: Int,
       callSite: CallSite): ResultStage = {
+    /*
+      stage 划分，从后往前划分
+      每个宽依赖，都会生成一个 shufferMapStage
+      返回 shufferMapStage list
+     */
     val parents = getOrCreateParentStages(rdd, jobId)
     val id = nextStageId.getAndIncrement()
+    /*
+      构建一个 ResultStage ，它依赖其所有父依赖的宽依赖
+       这里其实在构建DAG有向无环图，或者说是最后一个stage的 lineage
+     */
     val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
     stageIdToStage(id) = stage
     updateJobIdStageIdMaps(jobId, stage)
@@ -393,7 +401,7 @@ class DAGScheduler(
     // 根据传入的rdd，遍历rdd的所有依赖，返回一个HashSet包含rdd所有的ShuffleDependency
     getShuffleDependencies(rdd)
       .map { shuffleDep =>
-        // 根据传入的shuffleDen，生成shuffleStage
+        // 根据传入的shuffleDen，生成shuffleStage。每个宽依赖生成一个stage
       getOrCreateShuffleMapStage(shuffleDep, firstJobId)
     }.toList
   }
@@ -468,6 +476,7 @@ class DAGScheduler(
         if (rddHasUncachedPartitions) {
           for (dep <- rdd.dependencies) {
             dep match {
+              //注意：一个RDD可以有多个Dependency，比如CoGroupedRDD
               case shufDep: ShuffleDependency[_, _, _] =>
                 val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
                 if (!mapStage.isAvailable) {
@@ -872,6 +881,10 @@ class DAGScheduler(
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
+      /*
+        这里返回的其实是这个任务的 lineage
+        finalStage 包含所有依赖的其他上游 shufferStage
+       */
       finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
     } catch {
       case e: Exception =>
@@ -896,6 +909,9 @@ class DAGScheduler(
     val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
+    /*
+      根据stage 生成taskSets
+     */
     submitStage(finalStage)
   }
 
@@ -998,7 +1014,13 @@ class DAGScheduler(
         case s: ResultStage =>
           partitionsToCompute.map { id =>
             val p = s.partitions(id)
-            (id, getPreferredLocs(stage.rdd, p))
+            (
+              id,
+              /*
+                返回stage中每个partition数据缓存的位置信息
+               */
+              getPreferredLocs(stage.rdd, p)
+            )
           }.toMap
       }
     } catch {
@@ -1027,6 +1049,9 @@ class DAGScheduler(
     // task gets a different copy of the RDD. This provides stronger isolation between tasks that
     // might modify state of objects referenced in their closures. This is necessary in Hadoop
     // where the JobConf/Configuration object is not thread-safe.
+    // 如果是ShuffleMapStage就将其中RDD，及其依赖关系广播出去；如果是ResultStage
+    // 就将其中的RDD及其计算方法func广播出去。由此也可以看出真正触发计算的是ResultStage
+    // ShuffleMapStage不会触发计算。
     var taskBinary: Broadcast[Array[Byte]] = null
     var partitions: Array[Partition] = null
     try {
@@ -1040,7 +1065,7 @@ class DAGScheduler(
         taskBinaryBytes = stage match {
           case stage: ShuffleMapStage =>
             JavaUtils.bufferToArray(
-              closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
+                closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
           case stage: ResultStage =>
             JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
         }
@@ -1067,6 +1092,7 @@ class DAGScheduler(
       根据stage的类型，创建不同类型的task。
       如果是 ShuffleMapStage ，创建 ShuffleMapTask；
       如果是 ResultStage，创建 ResultTask
+      这里创建task时，采用了数据本地性的特点，task执行位置直接采用的是 partition 数据缓存的服务器位置
      */
     val tasks: Seq[Task[_]] = try {
       val serializedTaskMetrics = closureSerializer.serialize(stage.latestInfo.taskMetrics).array()
@@ -1106,7 +1132,10 @@ class DAGScheduler(
     if (tasks.size > 0) {
       logInfo(s"Submitting ${tasks.size} missing tasks from $stage (${stage.rdd}) (first 15 " +
         s"tasks are for partitions ${tasks.take(15).map(_.partitionId)})")
-      // 这里是空实现
+      /*
+        这里注意 taskScheduler 的具体实现是 TaskSchedulerImpl ，不是 ExternalClusterManagerSuite 【是空实现】切记！！！
+        向
+       */
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber, jobId, properties))
     } else {
@@ -1781,6 +1810,9 @@ class DAGScheduler(
       return Nil
     }
     // If the partition is cached, return the cache locations
+    /*
+      rdd 中partition数据缓存的位置
+     */
     val cached = getCacheLocs(rdd)(partition)
     if (cached.nonEmpty) {
       return cached
