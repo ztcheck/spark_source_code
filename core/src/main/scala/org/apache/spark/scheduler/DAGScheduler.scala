@@ -1017,7 +1017,7 @@ class DAGScheduler(
             (
               id,
               /*
-                返回stage中每个partition数据缓存的位置信息
+                返回stage中每个partition数据缓存的位置信息,或窄依赖链中第一个RDD的第一个partition的数据位置，作为task执行位置
                */
               getPreferredLocs(stage.rdd, p)
             )
@@ -1798,6 +1798,13 @@ class DAGScheduler(
    * This method is thread-safe because it only accesses DAGScheduler state through thread-safe
    * methods (getCacheLocs()); please be careful when modifying this method, because any new
    * DAGScheduler state accessed by it may require additional synchronization.
+    *
+    * /**
+    * * 计算每一个task对应的partition的最佳位置
+    * * 其实就是从stage的最后一个rdd开始找，哪个rdd的partition是被cache了，或者被checkPoint了
+    * * 那么task的最佳位置就是cache/checkPoint的位置
+    * * 因为这样的话，task的执行就不需要 计算之前的RDD了
+    **/
    */
   private def getPreferredLocsInternal(
       rdd: RDD[_],
@@ -1812,19 +1819,23 @@ class DAGScheduler(
     // If the partition is cached, return the cache locations
     /*
       rdd 中partition数据缓存的位置
+      block的位置
      */
     val cached = getCacheLocs(rdd)(partition)
     if (cached.nonEmpty) {
       return cached
     }
     // If the RDD has some placement preferences (as is the case for input RDDs), get those
+    /*
+      checkPoint RDD 的数据cache位置
+     */
     val rddPrefs = rdd.preferredLocations(rdd.partitions(partition)).toList
     if (rddPrefs.nonEmpty) {
       return rddPrefs.map(TaskLocation(_))
     }
 
     // If the RDD has narrow dependencies, pick the first partition of the first narrow dependency
-    // that has any placement preferences. Ideally we would choose based on transfer sizes,
+    // that has any placement preferences.【窄依赖链上第一个RDD的第一个partition】 Ideally we would choose based on transfer sizes,
     // but this will do for now.
     rdd.dependencies.foreach {
       case n: NarrowDependency[_] =>
